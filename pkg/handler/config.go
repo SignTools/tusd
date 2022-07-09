@@ -46,6 +46,10 @@ type Config struct {
 	// potentially set by proxies when generating an absolute URL in the
 	// response to POST requests.
 	RespectForwardedHeaders bool
+	// Use relative URLs instead of absolute URLs, useful if the server is behind reverse
+	// proxies, and you don't want to deal with forwarded headers.
+	// Note that the caller must support relative URLs for this to work.
+	UseRelativeUrls bool
 	// PreUploadCreateCallback will be invoked before a new upload is created, if the
 	// property is supplied. If the callback returns nil, the upload will be created.
 	// Otherwise the HTTP request will be aborted. This can be used to implement

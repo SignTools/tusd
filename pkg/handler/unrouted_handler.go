@@ -979,8 +979,9 @@ func (handler *UnroutedHandler) sendResp(w http.ResponseWriter, r *http.Request,
 
 // Make an absolute URLs to the given upload id. If the base path is absolute
 // it will be prepended else the host and protocol from the request is used.
+// Can also return a relative URL if enabled in configuration.
 func (handler *UnroutedHandler) absFileURL(r *http.Request, id string) string {
-	if handler.isBasePathAbs {
+	if handler.isBasePathAbs || handler.config.UseRelativeUrls {
 		return handler.basePath + id
 	}
 
