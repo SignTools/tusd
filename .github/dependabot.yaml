@@ -3,14 +3,26 @@ updates:
   - package-ecosystem: github-actions
     directory: /
     schedule:
-      interval: weekly
+      interval: monthly
+    groups:
+      gha:
+        patterns:
+          - '*'
 
   - package-ecosystem: docker
     directory: /
     schedule:
-      interval: weekly
+      interval: monthly
+    groups:
+      docker:
+        patterns:
+          - '*'
 
   - package-ecosystem: gomod
     directory: /
     schedule:
-      interval: weekly
+      interval: monthly
+    groups:
+      go:
+        patterns:
+          - '*'

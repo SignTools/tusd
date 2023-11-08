@@ -23,6 +23,13 @@ var Flags struct {
 	ShowGreeting            bool
 	DisableDownload         bool
 	DisableTermination      bool
+	DisableCors             bool
+	CorsAllowOrigin         string
+	CorsAllowCredentials    bool
+	CorsAllowMethods        string
+	CorsAllowHeaders        string
+	CorsMaxAge              string
+	CorsExposeHeaders       string
 	Timeout                 int64
 	S3Bucket                string
 	S3ObjectPrefix          string
@@ -58,6 +65,7 @@ var Flags struct {
 	TLSCertFile             string
 	TLSKeyFile              string
 	TLSMode                 string
+	ExperimentalProtocol    bool
 
 	CPUProfile string
 }
@@ -72,6 +80,13 @@ func ParseFlags() {
 	flag.BoolVar(&Flags.ShowGreeting, "show-greeting", true, "Show the greeting message")
 	flag.BoolVar(&Flags.DisableDownload, "disable-download", false, "Disable the download endpoint")
 	flag.BoolVar(&Flags.DisableTermination, "disable-termination", false, "Disable the termination endpoint")
+	flag.BoolVar(&Flags.DisableCors, "disable-cors", false, "Disable CORS headers")
+	flag.StringVar(&Flags.CorsAllowOrigin, "cors-allow-origin", ".*", "Regular expression used to determine if the Origin header is allowed. If not, no CORS headers will be sent. By default, all origins are allowed.")
+	flag.BoolVar(&Flags.CorsAllowCredentials, "cors-allow-credentials", false, "Allow credentials by setting Access-Control-Allow-Credentials: true")
+	flag.StringVar(&Flags.CorsAllowMethods, "cors-allow-methods", "", "Comma-separated list of request methods that are included in Access-Control-Allow-Methods in addition to the ones required by tusd")
+	flag.StringVar(&Flags.CorsAllowHeaders, "cors-allow-headers", "", "Comma-separated list of headers that are included in Access-Control-Allow-Headers in addition to the ones required by tusd")
+	flag.StringVar(&Flags.CorsMaxAge, "cors-max-age", "86400", "Value of the Access-Control-Max-Age header to control the cache duration of CORS responses.")
+	flag.StringVar(&Flags.CorsExposeHeaders, "cors-expose-headers", "", "Comma-separated list of headers that are included in Access-Control-Expose-Headers in addition to the ones required by tusd")
 	flag.Int64Var(&Flags.Timeout, "timeout", 6*1000, "Read timeout for connections in milliseconds.  A zero value means that reads will not timeout")
 	flag.StringVar(&Flags.S3Bucket, "s3-bucket", "", "Use AWS S3 with this bucket as storage backend (requires the AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY and AWS_REGION environment variables to be set)")
 	flag.StringVar(&Flags.S3ObjectPrefix, "s3-object-prefix", "", "Prefix for S3 object names")
@@ -106,6 +121,7 @@ func ParseFlags() {
 	flag.StringVar(&Flags.TLSCertFile, "tls-certificate", "", "Path to the file containing the x509 TLS certificate to be used. The file should also contain any intermediate certificates and the CA certificate.")
 	flag.StringVar(&Flags.TLSKeyFile, "tls-key", "", "Path to the file containing the key for the TLS certificate.")
 	flag.StringVar(&Flags.TLSMode, "tls-mode", "tls12", "Specify which TLS mode to use; valid modes are tls13, tls12, and tls12-strong.")
+	flag.BoolVar(&Flags.ExperimentalProtocol, "enable-experimental-protocol", false, "Enable support for the new resumable upload protocol draft from the IETF's HTTP working group, next to the current tus v1 protocol. (experimental and may be removed/changed in the future)")
 
 	flag.StringVar(&Flags.CPUProfile, "cpuprofile", "", "write cpu profile to file")
 	flag.Parse()

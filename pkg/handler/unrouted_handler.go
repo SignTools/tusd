@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"math"
+	"mime"
 	"net"
 	"net/http"
 	"regexp"
@@ -16,10 +17,11 @@ import (
 )
 
 const UploadLengthDeferred = "1"
+const currentUploadDraftInteropVersion = "3"
 
 var (
 	reExtractFileID  = regexp.MustCompile(`([^/]+)\/?$`)
-	reForwardedHost  = regexp.MustCompile(`host=([^;]+)`)
+	reForwardedHost  = regexp.MustCompile(`host="?([^;"]+)`)
 	reForwardedProto = regexp.MustCompile(`proto=(https?)`)
 	reMimeType       = regexp.MustCompile(`^[a-z]+\/[a-z0-9\-\+\.]+$`)
 )
@@ -70,6 +72,7 @@ var (
 	ErrUploadLengthAndUploadDeferLength = NewHTTPError(errors.New("provided both Upload-Length and Upload-Defer-Length"), http.StatusBadRequest)
 	ErrInvalidUploadDeferLength         = NewHTTPError(errors.New("invalid Upload-Defer-Length header"), http.StatusBadRequest)
 	ErrUploadStoppedByServer            = NewHTTPError(errors.New("upload has been stopped by server"), http.StatusBadRequest)
+	ErrOriginNotAllowed                 = NewHTTPError(errors.New("request origin is not allowed"), http.StatusForbidden)
 
 	errReadTimeout     = errors.New("read tcp: i/o timeout")
 	errConnectionReset = errors.New("read tcp: connection reset by peer")
@@ -98,6 +101,12 @@ type HookEvent struct {
 }
 
 func newHookEvent(info FileInfo, r *http.Request) HookEvent {
+	// The Host header field is not present in the header map, see https://pkg.go.dev/net/http#Request:
+	// > For incoming requests, the Host header is promoted to the
+	// > Request.Host field and removed from the Header map.
+	// That's why we add it back manually.
+	r.Header.Set("Host", r.Host)
+
 	return HookEvent{
 		Upload: info,
 		HTTPRequest: HTTPRequest{
@@ -205,9 +214,9 @@ func (handler *UnroutedHandler) SupportedExtensions() string {
 func (handler *UnroutedHandler) Middleware(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Allow overriding the HTTP method. The reason for this is
-		// that some libraries/environments to not support PATCH and
-		// DELETE requests, e.g. Flash in a browser and parts of Java
-		if newMethod := r.Header.Get("X-HTTP-Method-Override"); newMethod != "" {
+		// that some libraries/environments do not support PATCH and
+		// DELETE requests, e.g. Flash in a browser and parts of Java.
+		if newMethod := r.Header.Get("X-HTTP-Method-Override"); r.Method == "POST" && newMethod != "" {
 			r.Method = newMethod
 		}
 
@@ -217,32 +226,39 @@ func (handler *UnroutedHandler) Middleware(h http.Handler) http.Handler {
 
 		header := w.Header()
 
-		if origin := r.Header.Get("Origin"); origin != "" {
+		cors := handler.config.Cors
+		if origin := r.Header.Get("Origin"); !cors.Disable && origin != "" {
+			originIsAllowed := cors.AllowOrigin.MatchString(origin)
+			if !originIsAllowed {
+				handler.sendError(w, r, ErrOriginNotAllowed)
+				return
+			}
+
 			header.Set("Access-Control-Allow-Origin", origin)
+			header.Set("Vary", "Origin")
+
+			if cors.AllowCredentials {
+				header.Add("Access-Control-Allow-Credentials", "true")
+			}
 
 			if r.Method == "OPTIONS" {
-				allowedMethods := "POST, HEAD, PATCH, OPTIONS"
-				if !handler.config.DisableDownload {
-					allowedMethods += ", GET"
-				}
-
-				if !handler.config.DisableTermination {
-					allowedMethods += ", DELETE"
-				}
-
 				// Preflight request
-				header.Add("Access-Control-Allow-Methods", allowedMethods)
-				header.Add("Access-Control-Allow-Headers", "Authorization, Origin, X-Requested-With, X-Request-ID, X-HTTP-Method-Override, Content-Type, Upload-Length, Upload-Offset, Tus-Resumable, Upload-Metadata, Upload-Defer-Length, Upload-Concat")
-				header.Set("Access-Control-Max-Age", "86400")
-
+				header.Add("Access-Control-Allow-Methods", cors.AllowMethods)
+				header.Add("Access-Control-Allow-Headers", cors.AllowHeaders)
+				header.Set("Access-Control-Max-Age", cors.MaxAge)
 			} else {
 				// Actual request
-				header.Add("Access-Control-Expose-Headers", "Upload-Offset, Location, Upload-Length, Tus-Version, Tus-Resumable, Tus-Max-Size, Tus-Extension, Upload-Metadata, Upload-Defer-Length, Upload-Concat")
+				header.Add("Access-Control-Expose-Headers", cors.ExposeHeaders)
 			}
 		}
 
-		// Set current version used by the server
-		header.Set("Tus-Resumable", "1.0.0")
+		// Detect requests with tus v1 protocol vs the IETF resumable upload draft
+		isTusV1 := !handler.isResumableUploadDraftRequest(r)
+
+		if isTusV1 {
+			// Set current version used by the server
+			header.Set("Tus-Resumable", "1.0.0")
+		}
 
 		// Add nosniff to all responses https://golang.org/src/net/http/server.go#L1429
 		header.Set("X-Content-Type-Options", "nosniff")
@@ -271,7 +287,7 @@ func (handler *UnroutedHandler) Middleware(h http.Handler) http.Handler {
 		// Test if the version sent by the client is supported
 		// GET and HEAD methods are not checked since a browser may visit this URL and does
 		// not include this header. GET requests are not part of the specification.
-		if r.Method != "GET" && r.Method != "HEAD" && r.Header.Get("Tus-Resumable") != "1.0.0" {
+		if r.Method != "GET" && r.Method != "HEAD" && r.Header.Get("Tus-Resumable") != "1.0.0" && isTusV1 {
 			handler.sendError(w, r, ErrUnsupportedVersion)
 			return
 		}
@@ -284,6 +300,11 @@ func (handler *UnroutedHandler) Middleware(h http.Handler) http.Handler {
 // PostFile creates a new file upload using the datastore after validating the
 // length and parsing the metadata.
 func (handler *UnroutedHandler) PostFile(w http.ResponseWriter, r *http.Request) {
+	if handler.isResumableUploadDraftRequest(r) {
+		handler.PostFileV2(w, r)
+		return
+	}
+
 	ctx := context.Background()
 
 	// Check for presence of application/offset+octet-stream. If another content
@@ -425,6 +446,140 @@ func (handler *UnroutedHandler) PostFile(w http.ResponseWriter, r *http.Request)
 	handler.sendResp(w, r, http.StatusCreated)
 }
 
+// PostFile creates a new file upload using the datastore after validating the
+// length and parsing the metadata.
+func (handler *UnroutedHandler) PostFileV2(w http.ResponseWriter, r *http.Request) {
+	ctx := context.Background()
+
+	// Parse headers
+	contentType := r.Header.Get("Content-Type")
+	contentDisposition := r.Header.Get("Content-Disposition")
+	isComplete := r.Header.Get("Upload-Incomplete") == "?0"
+
+	info := FileInfo{
+		MetaData: make(MetaData),
+	}
+	if isComplete && r.ContentLength != -1 {
+		// If the client wants to perform the upload in one request with Content-Length, we know the final upload size.
+		info.Size = r.ContentLength
+	} else {
+		// Error out if the storage does not support upload length deferring, but we need it.
+		if !handler.composer.UsesLengthDeferrer {
+			handler.sendError(w, r, ErrNotImplemented)
+			return
+		}
+
+		info.SizeIsDeferred = true
+	}
+
+	// Parse Content-Type and Content-Disposition to get file type or file name
+	if contentType != "" {
+		fileType, _, err := mime.ParseMediaType(contentType)
+		if err != nil {
+			handler.sendError(w, r, err)
+			return
+		}
+
+		info.MetaData["filetype"] = fileType
+	}
+
+	if contentDisposition != "" {
+		_, values, err := mime.ParseMediaType(contentDisposition)
+		if err != nil {
+			handler.sendError(w, r, err)
+			return
+		}
+
+		if values["filename"] != "" {
+			info.MetaData["filename"] = values["filename"]
+		}
+	}
+
+	// 1. Create upload resource
+	if handler.config.PreUploadCreateCallback != nil {
+		if err := handler.config.PreUploadCreateCallback(newHookEvent(info, r)); err != nil {
+			handler.sendError(w, r, err)
+			return
+		}
+	}
+
+	upload, err := handler.composer.Core.NewUpload(ctx, info)
+	if err != nil {
+		handler.sendError(w, r, err)
+		return
+	}
+
+	info, err = upload.GetInfo(ctx)
+	if err != nil {
+		handler.sendError(w, r, err)
+		return
+	}
+
+	id := info.ID
+
+	// Add the Location header directly after creating the new resource to even
+	// include it in cases of failure when an error is returned
+	url := handler.absFileURL(r, id)
+	w.Header().Set("Location", url)
+
+	// Send 104 response
+	w.Header().Set("Upload-Draft-Interop-Version", currentUploadDraftInteropVersion)
+	w.WriteHeader(104)
+
+	handler.Metrics.incUploadsCreated()
+
+	handler.log("UploadCreated", "id", id, "size", i64toa(info.Size), "url", url)
+
+	if handler.config.NotifyCreatedUploads {
+		handler.CreatedUploads <- newHookEvent(info, r)
+	}
+
+	// 2. Lock upload
+	if handler.composer.UsesLocker {
+		lock, err := handler.lockUpload(id)
+		if err != nil {
+			handler.sendError(w, r, err)
+			return
+		}
+
+		defer lock.Unlock()
+	}
+
+	// 3. Write chunk
+	if err := handler.writeChunk(ctx, upload, info, w, r); err != nil {
+		handler.sendError(w, r, err)
+		return
+	}
+
+	// 4. Finish upload, if necessary
+	if isComplete && info.SizeIsDeferred {
+		info, err = upload.GetInfo(ctx)
+		if err != nil {
+			handler.sendError(w, r, err)
+			return
+		}
+
+		uploadLength := info.Offset
+
+		lengthDeclarableUpload := handler.composer.LengthDeferrer.AsLengthDeclarableUpload(upload)
+		if err := lengthDeclarableUpload.DeclareLength(ctx, uploadLength); err != nil {
+			handler.sendError(w, r, err)
+			return
+		}
+
+		info.Size = uploadLength
+		info.SizeIsDeferred = false
+
+		if err := handler.finishUploadIfComplete(ctx, upload, info, r); err != nil {
+			handler.sendError(w, r, err)
+			return
+		}
+
+	}
+
+	handler.sendResp(w, r, http.StatusCreated)
+}
+
 // HeadFile returns the length and offset for the HEAD request
 func (handler *UnroutedHandler) HeadFile(w http.ResponseWriter, r *http.Request) {
 	ctx := context.Background()
@@ -457,36 +612,52 @@ func (handler *UnroutedHandler) HeadFile(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	// Add Upload-Concat header if possible
-	if info.IsPartial {
-		w.Header().Set("Upload-Concat", "partial")
-	}
-
-	if info.IsFinal {
-		v := "final;"
-		for _, uploadID := range info.PartialUploads {
-			v += handler.absFileURL(r, uploadID) + " "
-		}
-		// Remove trailing space
-		v = v[:len(v)-1]
-
-		w.Header().Set("Upload-Concat", v)
-	}
-
-	if len(info.MetaData) != 0 {
-		w.Header().Set("Upload-Metadata", SerializeMetadataHeader(info.MetaData))
-	}
-
-	if info.SizeIsDeferred {
-		w.Header().Set("Upload-Defer-Length", UploadLengthDeferred)
-	} else {
-		w.Header().Set("Upload-Length", strconv.FormatInt(info.Size, 10))
-		w.Header().Set("Content-Length", strconv.FormatInt(info.Size, 10))
-	}
-
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Upload-Offset", strconv.FormatInt(info.Offset, 10))
-	handler.sendResp(w, r, http.StatusOK)
+
+	if !handler.isResumableUploadDraftRequest(r) {
+		// Add Upload-Concat header if possible
+		if info.IsPartial {
+			w.Header().Set("Upload-Concat", "partial")
+		}
+
+		if info.IsFinal {
+			v := "final;"
+			for _, uploadID := range info.PartialUploads {
+				v += handler.absFileURL(r, uploadID) + " "
+			}
+			// Remove trailing space
+			v = v[:len(v)-1]
+
+			w.Header().Set("Upload-Concat", v)
+		}
+
+		if len(info.MetaData) != 0 {
+			w.Header().Set("Upload-Metadata", SerializeMetadataHeader(info.MetaData))
+		}
+
+		if info.SizeIsDeferred {
+			w.Header().Set("Upload-Defer-Length", UploadLengthDeferred)
+		} else {
+			w.Header().Set("Upload-Length", strconv.FormatInt(info.Size, 10))
+			w.Header().Set("Content-Length", strconv.FormatInt(info.Size, 10))
+		}
+
+		// TODO: We send a 200 OK here by default. Can we switch this to 204?
+		handler.sendResp(w, r, http.StatusOK)
+	} else {
+		if !info.SizeIsDeferred && info.Offset == info.Size {
+			// Upload is complete if we know the size and it matches the offset.
+			w.Header().Set("Upload-Incomplete", "?0")
+		} else {
+			w.Header().Set("Upload-Incomplete", "?1")
+		}
+
+		w.Header().Set("Upload-Draft-Interop-Version", currentUploadDraftInteropVersion)
+
+		// Draft requires a 204 No Content response
+		handler.sendResp(w, r, http.StatusNoContent)
+	}
 }
 
 // PatchFile adds a chunk to an upload. This operation is only allowed
@@ -494,8 +665,10 @@ func (handler *UnroutedHandler) HeadFile(w http.ResponseWriter, r *http.Request)
 func (handler *UnroutedHandler) PatchFile(w http.ResponseWriter, r *http.Request) {
 	ctx := context.Background()
 
+	isTusV1 := !handler.isResumableUploadDraftRequest(r)
+
 	// Check for presence of application/offset+octet-stream
-	if r.Header.Get("Content-Type") != "application/offset+octet-stream" {
+	if isTusV1 && r.Header.Get("Content-Type") != "application/offset+octet-stream" {
 		handler.sendError(w, r, ErrInvalidContentType)
 		return
 	}
@@ -546,6 +719,10 @@ func (handler *UnroutedHandler) PatchFile(w http.ResponseWriter, r *http.Request
 		return
 	}
 
+	// TODO: If Upload-Incomplete: ?0 and Content-Length is set, we can
+	// - declare the length already here
+	// - validate that the length from this request matches info.Size if !info.SizeIsDeferred
+
 	// Do not proxy the call to the data store if the upload is already completed
 	if !info.SizeIsDeferred && info.Offset == info.Size {
 		w.Header().Set("Upload-Offset", strconv.FormatInt(offset, 10))
@@ -576,12 +753,37 @@ func (handler *UnroutedHandler) PatchFile(w http.ResponseWriter, r *http.Request
 
 		info.Size = uploadLength
 		info.SizeIsDeferred = false
-
 	}
 
 	if err := handler.writeChunk(ctx, upload, info, w, r); err != nil {
 		handler.sendError(w, r, err)
 		return
+	}
+
+	isComplete := r.Header.Get("Upload-Incomplete") == "?0"
+	if isComplete && info.SizeIsDeferred {
+		info, err = upload.GetInfo(ctx)
+		if err != nil {
+			handler.sendError(w, r, err)
+			return
+		}
+
+		uploadLength := info.Offset
+
+		lengthDeclarableUpload := handler.composer.LengthDeferrer.AsLengthDeclarableUpload(upload)
+		if err := lengthDeclarableUpload.DeclareLength(ctx, uploadLength); err != nil {
+			handler.sendError(w, r, err)
+			return
+		}
+
+		info.Size = uploadLength
+		info.SizeIsDeferred = false
+
+		if err := handler.finishUploadIfComplete(ctx, upload, info, r); err != nil {
+			handler.sendError(w, r, err)
+			return
+		}
+
 	}
 
 	handler.sendResp(w, r, http.StatusNoContent)
@@ -624,7 +826,7 @@ func (handler *UnroutedHandler) writeChunk(ctx context.Context, upload Upload, i
 	var err error
 	// Prevent a nil pointer dereference when accessing the body which may not be
 	// available in the case of a malicious request.
-	if r.Body != nil && maxSize > 0 {
+	if r.Body != nil {
 		// Limit the data read from the request's body to the allowed maximum
 		reader := newBodyReader(io.LimitReader(r.Body, maxSize))
 
@@ -803,7 +1005,7 @@ var mimeInlineBrowserWhitelist = map[string]struct{}{
 	"audio/webm":      struct{}{},
 	"video/webm":      struct{}{},
 	"audio/ogg":       struct{}{},
-	"video/ogg":      struct{}{},
+	"video/ogg":       struct{}{},
 	"application/ogg": struct{}{},
 }
 
@@ -1130,6 +1332,12 @@ func (handler *UnroutedHandler) lockUpload(id string) (Lock, error) {
 	}
 
 	return lock, nil
+}
+
+// isResumableUploadDraftRequest returns whether a HTTP request includes a sign that it is
+// related to resumable upload draft from IETF (instead of tus v1)
+func (handler UnroutedHandler) isResumableUploadDraftRequest(r *http.Request) bool {
+	return handler.config.EnableExperimentalProtocol && r.Header.Get("Upload-Draft-Interop-Version") == currentUploadDraftInteropVersion
 }
 
 // ParseMetadataHeader parses the Upload-Metadata header as defined in the
