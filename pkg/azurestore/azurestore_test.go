@@ -5,16 +5,17 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"testing"
 
-	"github.com/Azure/azure-storage-blob-go/azblob"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/bloberror"
 	"github.com/golang/mock/gomock"
 	"github.com/stretchr/testify/assert"
-	"github.com/tus/tusd/pkg/azurestore"
-	"github.com/tus/tusd/pkg/handler"
+	"github.com/tus/tusd/v2/pkg/azurestore"
+	"github.com/tus/tusd/v2/pkg/handler"
 )
 
-//go:generate mockgen -destination=./azurestore_mock_test.go -package=azurestore_test github.com/tus/tusd/pkg/azurestore AzService,AzBlob
+//go:generate mockgen -destination=./azurestore_mock_test.go -package=azurestore_test github.com/tus/tusd/v2/pkg/azurestore AzService,AzBlob
 
 // Test interface implementations
 var _ handler.DataStore = azurestore.AzureStore{}
@@ -153,7 +154,7 @@ func TestGetUpload(t *testing.T) {
 
 	gomock.InOrder(
 		service.EXPECT().NewBlob(ctx, mockID+".info").Return(infoBlob, nil).Times(1),
-		infoBlob.EXPECT().Download(ctx).Return(data, nil).Times(1),
+		infoBlob.EXPECT().Download(ctx).Return(newReadCloser(data), nil).Times(1),
 		service.EXPECT().NewBlob(ctx, mockID).Return(blockBlob, nil).Times(1),
 		blockBlob.EXPECT().GetOffset(ctx).Return(int64(0), nil).Times(1),
 	)
@@ -189,7 +190,7 @@ func TestGetUploadTooLargeBlob(t *testing.T) {
 
 	gomock.InOrder(
 		service.EXPECT().NewBlob(ctx, mockID+".info").Return(infoBlob, nil).Times(1),
-		infoBlob.EXPECT().Download(ctx).Return(data, nil).Times(1),
+		infoBlob.EXPECT().Download(ctx).Return(newReadCloser(data), nil).Times(1),
 	)
 
 	upload, err := store.GetUpload(ctx, mockID)
@@ -215,7 +216,7 @@ func TestGetUploadNotFound(t *testing.T) {
 	ctx := context.Background()
 	gomock.InOrder(
 		service.EXPECT().NewBlob(ctx, mockID+".info").Return(infoBlob, nil).Times(1),
-		infoBlob.EXPECT().Download(ctx).Return(nil, errors.New(string(azblob.StorageErrorCodeBlobNotFound))).Times(1),
+		infoBlob.EXPECT().Download(ctx).Return(nil, errors.New(string(bloberror.BlobNotFound))).Times(1),
 	)
 
 	_, err := store.GetUpload(context.Background(), mockID)
@@ -246,10 +247,10 @@ func TestGetReader(t *testing.T) {
 
 	gomock.InOrder(
 		service.EXPECT().NewBlob(ctx, mockID+".info").Return(infoBlob, nil).Times(1),
-		infoBlob.EXPECT().Download(ctx).Return(data, nil).Times(1),
+		infoBlob.EXPECT().Download(ctx).Return(newReadCloser(data), nil).Times(1),
 		service.EXPECT().NewBlob(ctx, mockID).Return(blockBlob, nil).Times(1),
 		blockBlob.EXPECT().GetOffset(ctx).Return(int64(0), nil).Times(1),
-		blockBlob.EXPECT().Download(ctx).Return([]byte(mockReaderData), nil).Times(1),
+		blockBlob.EXPECT().Download(ctx).Return(newReadCloser([]byte(mockReaderData)), nil).Times(1),
 	)
 
 	upload, err := store.GetUpload(ctx, mockID)
@@ -286,10 +287,15 @@ func TestWriteChunk(t *testing.T) {
 
 	gomock.InOrder(
 		service.EXPECT().NewBlob(ctx, mockID+".info").Return(infoBlob, nil).Times(1),
-		infoBlob.EXPECT().Download(ctx).Return(data, nil).Times(1),
+		infoBlob.EXPECT().Download(ctx).Return(newReadCloser(data), nil).Times(1),
 		service.EXPECT().NewBlob(ctx, mockID).Return(blockBlob, nil).Times(1),
 		blockBlob.EXPECT().GetOffset(ctx).Return(offset, nil).Times(1),
-		blockBlob.EXPECT().Upload(ctx, bytes.NewReader([]byte(mockReaderData))).Return(nil).Times(1),
+		blockBlob.EXPECT().Upload(ctx, gomock.Any()).DoAndReturn(func(_ context.Context, reader io.ReadSeeker) error {
+			actual, err := io.ReadAll(reader)
+			assert.Nil(err)
+			assert.Equal(mockReaderData, string(actual))
+			return nil
+		}).Times(1),
 	)
 
 	upload, err := store.GetUpload(ctx, mockID)
@@ -325,7 +331,7 @@ func TestFinishUpload(t *testing.T) {
 
 	gomock.InOrder(
 		service.EXPECT().NewBlob(ctx, mockID+".info").Return(infoBlob, nil).Times(1),
-		infoBlob.EXPECT().Download(ctx).Return(data, nil).Times(1),
+		infoBlob.EXPECT().Download(ctx).Return(newReadCloser(data), nil).Times(1),
 		service.EXPECT().NewBlob(ctx, mockID).Return(blockBlob, nil).Times(1),
 		blockBlob.EXPECT().GetOffset(ctx).Return(offset, nil).Times(1),
 		blockBlob.EXPECT().Commit(ctx).Return(nil).Times(1),
@@ -362,7 +368,7 @@ func TestTerminate(t *testing.T) {
 
 	gomock.InOrder(
 		service.EXPECT().NewBlob(ctx, mockID+".info").Return(infoBlob, nil).Times(1),
-		infoBlob.EXPECT().Download(ctx).Return(data, nil).Times(1),
+		infoBlob.EXPECT().Download(ctx).Return(newReadCloser(data), nil).Times(1),
 		service.EXPECT().NewBlob(ctx, mockID).Return(blockBlob, nil).Times(1),
 		blockBlob.EXPECT().GetOffset(ctx).Return(int64(0), nil).Times(1),
 		infoBlob.EXPECT().Delete(ctx).Return(nil).Times(1),
@@ -405,7 +411,7 @@ func TestDeclareLength(t *testing.T) {
 
 	gomock.InOrder(
 		service.EXPECT().NewBlob(ctx, mockID+".info").Return(infoBlob, nil).Times(1),
-		infoBlob.EXPECT().Download(ctx).Return(data, nil).Times(1),
+		infoBlob.EXPECT().Download(ctx).Return(newReadCloser(data), nil).Times(1),
 		service.EXPECT().NewBlob(ctx, mockID).Return(blockBlob, nil).Times(1),
 		blockBlob.EXPECT().GetOffset(ctx).Return(int64(0), nil).Times(1),
 		infoBlob.EXPECT().Upload(ctx, r).Return(nil).Times(1),
@@ -423,4 +429,8 @@ func TestDeclareLength(t *testing.T) {
 	assert.Equal(info.Size, mockSize*2)
 
 	cancel()
+}
+
+func newReadCloser(b []byte) io.ReadCloser {
+	return io.NopCloser(bytes.NewReader(b))
 }

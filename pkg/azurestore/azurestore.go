@@ -1,23 +1,29 @@
 package azurestore
 
 import (
-	"bufio"
 	"bytes"
 	"context"
-	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
+	"os"
 	"strings"
 
-	"github.com/tus/tusd/internal/uid"
-	"github.com/tus/tusd/pkg/handler"
+	"github.com/tus/tusd/v2/internal/uid"
+	"github.com/tus/tusd/v2/pkg/handler"
 )
 
 type AzureStore struct {
 	Service      AzService
 	ObjectPrefix string
 	Container    string
+
+	// TemporaryDirectory is the path where AzureStore will create temporary files
+	// on disk during the upload. An empty string ("", the default value) will
+	// cause AzureStore to use the operating system's default temporary directory.
+	TemporaryDirectory string
 }
 
 type AzUpload struct {
@@ -25,6 +31,8 @@ type AzUpload struct {
 	InfoBlob    AzBlob
 	BlockBlob   AzBlob
 	InfoHandler *handler.FileInfo
+
+	tempDir string
 }
 
 func New(service AzService) *AzureStore {
@@ -73,6 +81,7 @@ func (store AzureStore) NewUpload(ctx context.Context, info handler.FileInfo) (h
 		InfoHandler: &info,
 		InfoBlob:    infoBlob,
 		BlockBlob:   blockBlob,
+		tempDir:     store.TemporaryDirectory,
 	}
 
 	err = azUpload.writeInfo(ctx)
@@ -96,8 +105,9 @@ func (store AzureStore) GetUpload(ctx context.Context, id string) (handler.Uploa
 	if err != nil {
 		return nil, err
 	}
+	defer data.Close()
 
-	if err := json.Unmarshal(data, &info); err != nil {
+	if err := json.NewDecoder(data).Decode(&info); err != nil {
 		return nil, err
 	}
 
@@ -112,8 +122,12 @@ func (store AzureStore) GetUpload(ctx context.Context, id string) (handler.Uploa
 	}
 
 	offset, err := blockBlob.GetOffset(ctx)
-	if err != nil && err != handler.ErrNotFound {
-		return nil, err
+	if err != nil {
+		// Unpack the error and see if it is a handler.ErrNotFound by comparing the
+		// error code. If it matches, we ignore the error, otherwise we return the error.
+		if handlerErr, ok := err.(handler.Error); !ok || handlerErr.ErrorCode != handler.ErrNotFound.ErrorCode {
+			return nil, err
+		}
 	}
 
 	info.Offset = offset
@@ -123,6 +137,7 @@ func (store AzureStore) GetUpload(ctx context.Context, id string) (handler.Uploa
 		InfoHandler: &info,
 		InfoBlob:    infoBlob,
 		BlockBlob:   blockBlob,
+		tempDir:     store.TemporaryDirectory,
 	}, nil
 }
 
@@ -135,21 +150,38 @@ func (store AzureStore) AsLengthDeclarableUpload(upload handler.Upload) handler.
 }
 
 func (upload *AzUpload) WriteChunk(ctx context.Context, offset int64, src io.Reader) (int64, error) {
-	r := bufio.NewReader(src)
-	buf := new(bytes.Buffer)
-	n, err := r.WriteTo(buf)
+	// Create a temporary file for holding the uploaded data
+	file, err := os.CreateTemp(upload.tempDir, "tusd-az-tmp-")
 	if err != nil {
 		return 0, err
 	}
+	defer os.Remove(file.Name())
 
-	chunkSize := int64(binary.Size(buf.Bytes()))
-	if chunkSize > MaxBlockBlobChunkSize {
-		return 0, fmt.Errorf("azurestore: Chunk of size %v too large. Max chunk size is %v", chunkSize, MaxBlockBlobChunkSize)
+	// Copy the entire request body into the file
+	n, err := io.Copy(file, src)
+	if err != nil {
+		file.Close()
+		return 0, err
 	}
 
-	re := bytes.NewReader(buf.Bytes())
-	err = upload.BlockBlob.Upload(ctx, re)
+	// Seek to the beginning
+	if _, err := file.Seek(0, 0); err != nil {
+		file.Close()
+		return 0, err
+	}
+
+	if n > MaxBlockBlobChunkSize {
+		file.Close()
+		return 0, fmt.Errorf("azurestore: Chunk of size %v too large. Max chunk size is %v", n, MaxBlockBlobChunkSize)
+	}
+
+	err = upload.BlockBlob.Upload(ctx, file)
 	if err != nil {
+		file.Close()
+		return 0, err
+	}
+
+	if err := file.Close(); err != nil && !errors.Is(err, fs.ErrClosed) {
 		return 0, err
 	}
 
@@ -169,7 +201,7 @@ func (upload *AzUpload) GetInfo(ctx context.Context) (handler.FileInfo, error) {
 		return info, err
 	}
 
-	if err := json.Unmarshal(data, &info); err != nil {
+	if err := json.NewDecoder(data).Decode(&info); err != nil {
 		return info, err
 	}
 
@@ -178,12 +210,8 @@ func (upload *AzUpload) GetInfo(ctx context.Context) (handler.FileInfo, error) {
 }
 
 // Get the uploaded file from the Azure storage
-func (upload *AzUpload) GetReader(ctx context.Context) (io.Reader, error) {
-	b, err := upload.BlockBlob.Download(ctx)
-	if err != nil {
-		return nil, err
-	}
-	return bytes.NewReader(b), nil
+func (upload *AzUpload) GetReader(ctx context.Context) (io.ReadCloser, error) {
+	return upload.BlockBlob.Download(ctx)
 }
 
 // Finish the file upload and commit the block list

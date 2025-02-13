@@ -1,7 +1,6 @@
 package handler_test
 
 import (
-	"context"
 	"net/http"
 	"strings"
 	"testing"
@@ -9,12 +8,12 @@ import (
 	"github.com/golang/mock/gomock"
 	"github.com/stretchr/testify/assert"
 
-	. "github.com/tus/tusd/pkg/handler"
+	. "github.com/tus/tusd/v2/pkg/handler"
 )
 
 func TestConcat(t *testing.T) {
-	SubTest(t, "ExtensionDiscovery", func(t *testing.T, store *MockFullDataStore, composer *StoreComposer) {
-		composer = NewStoreComposer()
+	SubTest(t, "ExtensionDiscovery", func(t *testing.T, store *MockFullDataStore, _ *StoreComposer) {
+		composer := NewStoreComposer()
 		composer.UseCore(store)
 		composer.UseConcater(store)
 
@@ -38,14 +37,14 @@ func TestConcat(t *testing.T) {
 			upload := NewMockFullUpload(ctrl)
 
 			gomock.InOrder(
-				store.EXPECT().NewUpload(context.Background(), FileInfo{
+				store.EXPECT().NewUpload(gomock.Any(), FileInfo{
 					Size:           300,
 					IsPartial:      true,
 					IsFinal:        false,
 					PartialUploads: nil,
 					MetaData:       make(map[string]string),
 				}).Return(upload, nil),
-				upload.EXPECT().GetInfo(context.Background()).Return(FileInfo{
+				upload.EXPECT().GetInfo(gomock.Any()).Return(FileInfo{
 					ID:             "foo",
 					Size:           300,
 					IsPartial:      true,
@@ -77,8 +76,8 @@ func TestConcat(t *testing.T) {
 			upload := NewMockFullUpload(ctrl)
 
 			gomock.InOrder(
-				store.EXPECT().GetUpload(context.Background(), "foo").Return(upload, nil),
-				upload.EXPECT().GetInfo(context.Background()).Return(FileInfo{
+				store.EXPECT().GetUpload(gomock.Any(), "foo").Return(upload, nil),
+				upload.EXPECT().GetInfo(gomock.Any()).Return(FileInfo{
 					ID:        "foo",
 					IsPartial: true,
 				}, nil),
@@ -114,26 +113,26 @@ func TestConcat(t *testing.T) {
 			uploadC := NewMockFullUpload(ctrl)
 
 			gomock.InOrder(
-				store.EXPECT().GetUpload(context.Background(), "a").Return(uploadA, nil),
-				uploadA.EXPECT().GetInfo(context.Background()).Return(FileInfo{
+				store.EXPECT().GetUpload(gomock.Any(), "a").Return(uploadA, nil),
+				uploadA.EXPECT().GetInfo(gomock.Any()).Return(FileInfo{
 					IsPartial: true,
 					Size:      5,
 					Offset:    5,
 				}, nil),
-				store.EXPECT().GetUpload(context.Background(), "b").Return(uploadB, nil),
-				uploadB.EXPECT().GetInfo(context.Background()).Return(FileInfo{
+				store.EXPECT().GetUpload(gomock.Any(), "b").Return(uploadB, nil),
+				uploadB.EXPECT().GetInfo(gomock.Any()).Return(FileInfo{
 					IsPartial: true,
 					Size:      5,
 					Offset:    5,
 				}, nil),
-				store.EXPECT().NewUpload(context.Background(), FileInfo{
+				store.EXPECT().NewUpload(gomock.Any(), FileInfo{
 					Size:           10,
 					IsPartial:      false,
 					IsFinal:        true,
 					PartialUploads: []string{"a", "b"},
 					MetaData:       make(map[string]string),
 				}).Return(uploadC, nil),
-				uploadC.EXPECT().GetInfo(context.Background()).Return(FileInfo{
+				uploadC.EXPECT().GetInfo(gomock.Any()).Return(FileInfo{
 					ID:             "foo",
 					Size:           10,
 					IsPartial:      false,
@@ -142,13 +141,21 @@ func TestConcat(t *testing.T) {
 					MetaData:       make(map[string]string),
 				}, nil),
 				store.EXPECT().AsConcatableUpload(uploadC).Return(uploadC),
-				uploadC.EXPECT().ConcatUploads(context.Background(), []Upload{uploadA, uploadB}).Return(nil),
+				uploadC.EXPECT().ConcatUploads(gomock.Any(), []Upload{uploadA, uploadB}).Return(nil),
 			)
 
 			handler, _ := NewHandler(Config{
 				BasePath:              "files",
 				StoreComposer:         composer,
 				NotifyCompleteUploads: true,
+				PreFinishResponseCallback: func(hook HookEvent) (HTTPResponse, error) {
+					a.Equal("foo", hook.Upload.ID)
+					return HTTPResponse{
+						Header: HTTPHeader{
+							"X-Custom-Resp-Header": "hello",
+						},
+					}, nil
+				},
 			})
 
 			c := make(chan HookEvent, 1)
@@ -161,10 +168,13 @@ func TestConcat(t *testing.T) {
 					// A space between `final;` and the first URL should be allowed due to
 					// compatibility reasons, even if the specification does not define
 					// it. Therefore this character is included in this test case.
-					"Upload-Concat":   "final; http://tus.io/files/a /files/b/",
-					"X-Custom-Header": "tada",
+					"Upload-Concat":       "final; http://tus.io/files/a /files/b/",
+					"X-Custom-Req-Header": "tada",
 				},
 				Code: http.StatusCreated,
+				ResHeader: map[string]string{
+					"X-Custom-Resp-Header": "hello",
+				},
 			}).Run(handler, t)
 
 			event := <-c
@@ -179,7 +189,7 @@ func TestConcat(t *testing.T) {
 			req := event.HTTPRequest
 			a.Equal("POST", req.Method)
 			a.Equal("", req.URI)
-			a.Equal("tada", req.Header.Get("X-Custom-Header"))
+			a.Equal("tada", req.Header.Get("X-Custom-Req-Header"))
 		})
 
 		SubTest(t, "Status", func(t *testing.T, store *MockFullDataStore, composer *StoreComposer) {
@@ -188,8 +198,8 @@ func TestConcat(t *testing.T) {
 			upload := NewMockFullUpload(ctrl)
 
 			gomock.InOrder(
-				store.EXPECT().GetUpload(context.Background(), "foo").Return(upload, nil),
-				upload.EXPECT().GetInfo(context.Background()).Return(FileInfo{
+				store.EXPECT().GetUpload(gomock.Any(), "foo").Return(upload, nil),
+				upload.EXPECT().GetInfo(gomock.Any()).Return(FileInfo{
 					ID:             "foo",
 					IsFinal:        true,
 					PartialUploads: []string{"a", "b"},
@@ -226,8 +236,8 @@ func TestConcat(t *testing.T) {
 			// This upload is still unfinished (mismatching offset and size) and
 			// will therefore cause the POST request to fail.
 			gomock.InOrder(
-				store.EXPECT().GetUpload(context.Background(), "c").Return(upload, nil),
-				upload.EXPECT().GetInfo(context.Background()).Return(FileInfo{
+				store.EXPECT().GetUpload(gomock.Any(), "c").Return(upload, nil),
+				upload.EXPECT().GetInfo(gomock.Any()).Return(FileInfo{
 					ID:        "c",
 					IsPartial: true,
 					Size:      5,
@@ -256,8 +266,8 @@ func TestConcat(t *testing.T) {
 			upload := NewMockFullUpload(ctrl)
 
 			gomock.InOrder(
-				store.EXPECT().GetUpload(context.Background(), "huge").Return(upload, nil),
-				upload.EXPECT().GetInfo(context.Background()).Return(FileInfo{
+				store.EXPECT().GetUpload(gomock.Any(), "huge").Return(upload, nil),
+				upload.EXPECT().GetInfo(gomock.Any()).Return(FileInfo{
 					ID:     "huge",
 					Size:   1000,
 					Offset: 1000,
@@ -286,8 +296,8 @@ func TestConcat(t *testing.T) {
 			upload := NewMockFullUpload(ctrl)
 
 			gomock.InOrder(
-				store.EXPECT().GetUpload(context.Background(), "foo").Return(upload, nil),
-				upload.EXPECT().GetInfo(context.Background()).Return(FileInfo{
+				store.EXPECT().GetUpload(gomock.Any(), "foo").Return(upload, nil),
+				upload.EXPECT().GetInfo(gomock.Any()).Return(FileInfo{
 					ID:      "foo",
 					Size:    10,
 					Offset:  0,
@@ -325,6 +335,61 @@ func TestConcat(t *testing.T) {
 					"Upload-Concat": "final;",
 				},
 				Code: http.StatusBadRequest,
+			}).Run(handler, t)
+		})
+
+		// Test that we can concatenate uploads, whose IDs contain slashes.
+		SubTest(t, "UploadIDsWithSlashes", func(t *testing.T, store *MockFullDataStore, composer *StoreComposer) {
+			ctrl := gomock.NewController(t)
+			defer ctrl.Finish()
+			uploadA := NewMockFullUpload(ctrl)
+			uploadB := NewMockFullUpload(ctrl)
+			uploadC := NewMockFullUpload(ctrl)
+
+			gomock.InOrder(
+				store.EXPECT().GetUpload(gomock.Any(), "aaa/123").Return(uploadA, nil),
+				uploadA.EXPECT().GetInfo(gomock.Any()).Return(FileInfo{
+					IsPartial: true,
+					Size:      5,
+					Offset:    5,
+				}, nil),
+				store.EXPECT().GetUpload(gomock.Any(), "bbb/123").Return(uploadB, nil),
+				uploadB.EXPECT().GetInfo(gomock.Any()).Return(FileInfo{
+					IsPartial: true,
+					Size:      5,
+					Offset:    5,
+				}, nil),
+				store.EXPECT().NewUpload(gomock.Any(), FileInfo{
+					Size:           10,
+					IsPartial:      false,
+					IsFinal:        true,
+					PartialUploads: []string{"aaa/123", "bbb/123"},
+					MetaData:       make(map[string]string),
+				}).Return(uploadC, nil),
+				uploadC.EXPECT().GetInfo(gomock.Any()).Return(FileInfo{
+					ID:             "foo",
+					Size:           10,
+					IsPartial:      false,
+					IsFinal:        true,
+					PartialUploads: []string{"aaa/123", "bbb/123"},
+					MetaData:       make(map[string]string),
+				}, nil),
+				store.EXPECT().AsConcatableUpload(uploadC).Return(uploadC),
+				uploadC.EXPECT().ConcatUploads(gomock.Any(), []Upload{uploadA, uploadB}).Return(nil),
+			)
+
+			handler, _ := NewHandler(Config{
+				BasePath:      "files",
+				StoreComposer: composer,
+			})
+
+			(&httpTest{
+				Method: "POST",
+				ReqHeader: map[string]string{
+					"Tus-Resumable": "1.0.0",
+					"Upload-Concat": "final; http://tus.io/files/aaa/123 /files/bbb/123",
+				},
+				Code: http.StatusCreated,
 			}).Run(handler, t)
 		})
 	})

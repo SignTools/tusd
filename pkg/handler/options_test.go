@@ -4,12 +4,12 @@ import (
 	"net/http"
 	"testing"
 
-	. "github.com/tus/tusd/pkg/handler"
+	. "github.com/tus/tusd/v2/pkg/handler"
 )
 
 func TestOptions(t *testing.T) {
-	SubTest(t, "Discovery", func(t *testing.T, store *MockFullDataStore, composer *StoreComposer) {
-		composer = NewStoreComposer()
+	SubTest(t, "Discovery", func(t *testing.T, store *MockFullDataStore, _ *StoreComposer) {
+		composer := NewStoreComposer()
 		composer.UseCore(store)
 
 		handler, _ := NewHandler(Config{
@@ -40,6 +40,28 @@ func TestOptions(t *testing.T) {
 				"Tus-Resumable": "foo",
 			},
 			Code: http.StatusPreconditionFailed,
+		}).Run(handler, t)
+	})
+
+	SubTest(t, "ExperimentalProtocol", func(t *testing.T, store *MockFullDataStore, _ *StoreComposer) {
+		composer := NewStoreComposer()
+		composer.UseCore(store)
+
+		handler, _ := NewHandler(Config{
+			StoreComposer:              composer,
+			EnableExperimentalProtocol: true,
+			MaxSize:                    400,
+		})
+
+		(&httpTest{
+			Method: "OPTIONS",
+			ReqHeader: map[string]string{
+				"Upload-Draft-Interop-Version": "6",
+			},
+			ResHeader: map[string]string{
+				"Upload-Limit": "min-size=0,max-size=400",
+			},
+			Code: http.StatusOK,
 		}).Run(handler, t)
 	})
 }
