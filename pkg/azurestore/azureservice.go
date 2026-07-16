@@ -15,18 +15,21 @@
 package azurestore
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"sort"
 	"strings"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/to"
+	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/blob"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/bloberror"
@@ -39,7 +42,16 @@ const (
 	InfoBlobSuffix        string = ".info"
 	MaxBlockBlobSize      int64  = blockblob.MaxBlocks * blockblob.MaxStageBlockBytes
 	MaxBlockBlobChunkSize int64  = blockblob.MaxStageBlockBytes
+
+	// sentinelBlockIndex is a reserved block index for the marker block that is
+	// staged when an upload is created (see StageSentinelBlock). It sits far above
+	// the maximum number of blocks Azure allows per blob (blockblob.MaxBlocks), so
+	// it can never collide with a data block index.
+	sentinelBlockIndex int = math.MaxInt32
 )
+
+// sentinelBlockID is the base64 block ID of the marker block. See StageSentinelBlock.
+var sentinelBlockID = blockIDIntToBase64(sentinelBlockIndex)
 
 type azService struct {
 	ContainerClient *container.Client
@@ -65,6 +77,9 @@ type AzBlob interface {
 	Delete(ctx context.Context) error
 	// Upload the blob
 	Upload(ctx context.Context, body io.ReadSeeker) error
+	// StageSentinelBlock stages a marker block so that a freshly created upload
+	// always has at least one uncommitted block (see GetOffset).
+	StageSentinelBlock(ctx context.Context) error
 	// Download returns a readcloser to download the contents of the blob
 	Download(ctx context.Context) (io.ReadCloser, error)
 	// Get the offset of the blob and its indexes
@@ -85,25 +100,36 @@ type InfoBlob struct {
 
 // New Azure service for communication to Azure BlockBlob Storage API
 func NewAzureService(config *AzConfig) (AzService, error) {
-	// struct to store your credentials.
-	cred, err := azblob.NewSharedKeyCredential(config.AccountName, config.AccountKey)
-	if err != nil {
-		return nil, err
-	}
 
 	serviceURL := fmt.Sprintf("%s/%s", config.Endpoint, config.ContainerName)
-	retryOpts := policy.RetryOptions{
-		MaxRetries:    5,
-		RetryDelay:    100,  // Retry after 100ms initially
-		MaxRetryDelay: 5000, // Max retry delay 5 seconds
-	}
-	containerClient, err := container.NewClientWithSharedKeyCredential(serviceURL, cred, &container.ClientOptions{
+	clientOptions := &container.ClientOptions{
 		ClientOptions: azcore.ClientOptions{
-			Retry: retryOpts,
+			Retry: policy.RetryOptions{
+				MaxRetries:    5,
+				RetryDelay:    100,  // Retry after 100ms initially
+				MaxRetryDelay: 5000, // Max retry delay 5 seconds
+			},
 		},
-	})
-	if err != nil {
-		return nil, err
+	}
+	var containerClient *container.Client
+	if config.AccountKey != "" {
+		cred, err := azblob.NewSharedKeyCredential(config.AccountName, config.AccountKey)
+		if err != nil {
+			return nil, err
+		}
+		containerClient, err = container.NewClientWithSharedKeyCredential(serviceURL, cred, clientOptions)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		cred, err := azidentity.NewDefaultAzureCredential(nil)
+		if err != nil {
+			return nil, err
+		}
+		containerClient, err = container.NewClient(serviceURL, cred, clientOptions)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	containerCreateOptions := &container.CreateOptions{}
@@ -116,7 +142,7 @@ func NewAzureService(config *AzConfig) (AzService, error) {
 		// Leaving Access nil will default to private access
 	}
 
-	_, err = containerClient.Create(context.Background(), containerCreateOptions)
+	_, err := containerClient.Create(context.Background(), containerCreateOptions)
 	if err != nil && !strings.Contains(err.Error(), "ContainerAlreadyExists") {
 		return nil, err
 	}
@@ -178,6 +204,23 @@ func (blockBlob *BlockBlob) Upload(ctx context.Context, body io.ReadSeeker) erro
 	return err
 }
 
+// StageSentinelBlock stages a marker block so that a freshly created upload always
+// has at least one uncommitted block. This lets GetOffset reliably tell a finished
+// upload (no uncommitted blocks) apart from a newly created one, even when blob
+// versioning leaves committed blocks behind on the blob (see #1349).
+//
+// The marker is identified by a dedicated, reserved block ID, so it is never added
+// to the committed block list (Commit only commits blockBlob.Indexes) and is dropped
+// by Azure once the real blocks are committed. GetOffset skips it explicitly.
+//
+// Azure rejects staging a zero-length block (it returns InvalidHeaderValue for
+// Content-Length: 0, see #1358), so the marker carries a single byte.
+func (blockBlob *BlockBlob) StageSentinelBlock(ctx context.Context) error {
+	body := readSeekCloser{bytes.NewReader([]byte{0})}
+	_, err := blockBlob.BlobClient.StageBlock(ctx, sentinelBlockID, body, nil)
+	return err
+}
+
 // Download the blockBlob from Azure Blob Storage
 func (blockBlob *BlockBlob) Download(ctx context.Context) (io.ReadCloser, error) {
 	resp, err := blockBlob.BlobClient.DownloadStream(ctx, nil)
@@ -188,9 +231,6 @@ func (blockBlob *BlockBlob) Download(ctx context.Context) (io.ReadCloser, error)
 }
 
 func (blockBlob *BlockBlob) GetOffset(ctx context.Context) (int64, error) {
-	// Get the offset of the file from azure storage
-	// For the blob, show each block (ID and size) that is a committed part of it.
-	var indexes []int
 	var offset int64
 
 	resp, err := blockBlob.BlobClient.GetBlockList(ctx, blockblob.BlockListTypeAll, nil)
@@ -198,13 +238,24 @@ func (blockBlob *BlockBlob) GetOffset(ctx context.Context) (int64, error) {
 		return 0, checkForNotFoundError(err)
 	}
 
-	// Need committed blocks to be added to offset to know how big the file really is
-	for _, block := range resp.CommittedBlocks {
-		offset += *block.Size
-		indexes = append(indexes, blockIDBase64ToInt(block.Name))
+	// If no uncommitted blocks are found, the upload is complete and we just count
+	// the committed blocks. Unfinished uploads always contain an uncommitted block,
+	// which is created when the upload is started (see NewUpload).
+	// This is necessary to distinguish completed and new uploads when versioning is enabled.
+	if len(resp.UncommittedBlocks) == 0 {
+		for _, block := range resp.CommittedBlocks {
+			offset += *block.Size
+		}
+		return offset, nil
 	}
-	// Need to get the uncommitted blocks so that we can commit them
+
+	var indexes []int
 	for _, block := range resp.UncommittedBlocks {
+		// Skip the marker block staged in NewUpload (see StageSentinelBlock); it is
+		// not real data and must not contribute to the offset or the block indexes.
+		if block.Name != nil && *block.Name == sentinelBlockID {
+			continue
+		}
 		offset += *block.Size
 		indexes = append(indexes, blockIDBase64ToInt(block.Name))
 	}
@@ -242,6 +293,11 @@ func (infoBlob *InfoBlob) Delete(ctx context.Context) error {
 func (infoBlob *InfoBlob) Upload(ctx context.Context, body io.ReadSeeker) error {
 	_, err := infoBlob.BlobClient.UploadStream(ctx, body, nil)
 	return err
+}
+
+// infoBlob does not use a sentinel block, so this is a no-op.
+func (infoBlob *InfoBlob) StageSentinelBlock(ctx context.Context) error {
+	return nil
 }
 
 // Download the infoBlob from Azure Blob Storage
@@ -283,7 +339,6 @@ func blockIDIntToBase64(blockID int) string {
 }
 
 func blockIDBase64ToInt(blockID *string) int {
-	blockIDBase64ToBinary(blockID)
 	return int(binary.LittleEndian.Uint32(blockIDBase64ToBinary(blockID)))
 }
 
