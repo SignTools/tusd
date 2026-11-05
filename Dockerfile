@@ -1,4 +1,4 @@
-FROM --platform=$BUILDPLATFORM golang:1.26.4-alpine AS builder
+FROM --platform=$BUILDPLATFORM golang:1.27.3-alpine AS builder
 WORKDIR /go/src/github.com/tus/tusd
 
 # Add gcc and libc-dev early so it is cached
@@ -29,13 +29,14 @@ RUN set -xe \
         -o /go/bin/tusd ./cmd/tusd/main.go
 
 # start a new stage that copies in the binary built in the previous stage
-FROM alpine:3.24.1
+FROM alpine:3.24.3
 WORKDIR /srv/tusd-data
 
 COPY ./docker/entrypoint.sh /usr/local/share/docker-entrypoint.sh
 COPY ./docker/load-env.sh /usr/local/share/load-env.sh
 
-RUN apk add --no-cache ca-certificates jq bash \
+RUN apk upgrade --no-cache \
+    && apk add --no-cache ca-certificates jq bash \
     && addgroup -g 1000 tusd \
     && adduser -u 1000 -G tusd -s /bin/sh -D tusd \
     && mkdir -p /srv/tusd-hooks \
